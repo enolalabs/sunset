@@ -276,12 +276,22 @@ function Invoke-PackageTests {
     Write-Host ""
     Write-Host "=== Package-and-verify helper tests ==="
 
-    $goodStub = Join-Path $TestRoot "sunset-good.ps1"
     $archiveDir = Join-Path $TestRoot "archives1"
+
+    # Build a real Windows binary for the package test. A PowerShell stub
+    # renamed to .exe cannot be executed directly on Windows, so we use
+    # go build to create a real PE binary with the expected version.
+    Write-Host "  building test binary ..."
+    $realExe = Join-Path $TestRoot "sunset.exe"
+    $buildOut = & go build -trimpath -ldflags "-s -w -X github.com/enolalabs/sunset/internal/version.BuildVersion=1.0.1" -o $realExe ./cmd/sunset/ 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  go build failed:" $buildOut
+        exit 1
+    }
 
     # 1. Full success path
     Test-Start "package: full success path prints one archive path"
-    $out = & pwsh -NoProfile -File (Join-Path $ScriptDir "package-and-verify.ps1") -Executable $goodStub -Version "1.0.1" -Fixture $Fixture -ArchiveOutputDir $archiveDir 2>&1
+    $out = & pwsh -NoProfile -File (Join-Path $ScriptDir "package-and-verify.ps1") -Executable $realExe -Version "1.0.1" -Fixture $Fixture -ArchiveOutputDir $archiveDir 2>&1
     Test-ExitZero $LASTEXITCODE
 
     Test-Start "package: stdout is exactly one line"

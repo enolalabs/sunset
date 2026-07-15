@@ -592,15 +592,15 @@ jobs:
         run: |
           set -uo pipefail
           mkdir -p draft-assets
-          while IFS=$'\t' read -r name asset_id; do
-            gh api -H "Accept: application/octet-stream" "repos/${REPO}/releases/assets/${asset_id}" > "draft-assets/${name}"
-          done < <(
-            gh api "repos/${REPO}/releases/${DRAFT_RELEASE_ID}/assets" --jq '.[] | "\(.name)\t\(.id)"'
-          )
-          if ! compgen -G "draft-assets/*" >/dev/null; then
+          release_json="$(gh api "repos/${REPO}/releases/${DRAFT_RELEASE_ID}")"
+          asset_count="$(printf '%s' "$release_json" | jq '.assets | length')"
+          if [[ "$asset_count" -eq 0 ]]; then
             echo "no assets on draft release $DRAFT_RELEASE_ID" >&2
             exit 1
           fi
+          while IFS=$'\t' read -r name asset_id; do
+            gh api -H "Accept: application/octet-stream" "repos/${REPO}/releases/assets/${asset_id}" > "draft-assets/${name}"
+          done < <(printf '%s' "$release_json" | jq -r '.assets[] | "\(.name)\t\(.id)"')
           ls -la draft-assets/
 
       - name: Verify asset checksums

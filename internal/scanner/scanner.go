@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/enolalab/sunset/internal/language"
+	"github.com/enolalabs/sunset/internal/language"
 )
 
 // defaultSkipDirs are directories always skipped during scanning.

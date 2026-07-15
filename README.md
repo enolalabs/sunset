@@ -19,12 +19,12 @@ Sunset scans your project, extracts functions, types, imports, and docstrings, t
 ### From source
 
 ```bash
-go install github.com/enolalab/sunset/cmd/sunset@latest
+go install github.com/enolalabs/sunset/cmd/sunset@latest
 ```
 
 ### From binary
 
-Download from [GitHub Releases](https://github.com/enolalab/sunset/releases):
+Download from [GitHub Releases](https://github.com/enolalabs/sunset/releases):
 
 | Platform | Architecture | File |
 |---|---|---|
@@ -34,14 +34,14 @@ Download from [GitHub Releases](https://github.com/enolalab/sunset/releases):
 
 ```bash
 # Example: Linux amd64
-curl -sL https://github.com/enolalab/sunset/releases/latest/download/sunset_1.0.0_linux_amd64.tar.gz | tar xz
+curl -sL https://github.com/enolalabs/sunset/releases/latest/download/sunset_1.0.0_linux_amd64.tar.gz | tar xz
 sudo mv sunset /usr/local/bin/
 ```
 
 ### Build locally
 
 ```bash
-git clone https://github.com/enolalab/sunset.git
+git clone https://github.com/enolalabs/sunset.git
 cd sunset
 make build
 # Binary: bin/sunset
@@ -165,7 +165,7 @@ package main
 
 import (
     "fmt"
-    "github.com/enolalab/sunset/pkg/sunset"
+    "github.com/enolalabs/sunset/pkg/sunset"
 )
 
 func main() {

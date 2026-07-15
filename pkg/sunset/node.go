@@ -1,7 +1,7 @@
 package sunset
 
 import (
-	"github.com/enolalab/sunset/internal/parser"
+	"github.com/enolalabs/sunset/internal/parser"
 
 	tree_sitter "github.com/tree-sitter/go-tree-sitter"
 )

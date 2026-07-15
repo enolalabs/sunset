@@ -3,7 +3,7 @@ package docstring
 import (
 	"testing"
 
-	"github.com/enolalab/sunset/internal/parser"
+	"github.com/enolalabs/sunset/internal/parser"
 
 	tree_sitter "github.com/tree-sitter/go-tree-sitter"
 	tree_sitter_go "github.com/tree-sitter/tree-sitter-go/bindings/go"

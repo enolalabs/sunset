@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/enolalab/sunset/internal/cache"
-	"github.com/enolalab/sunset/internal/output"
+	"github.com/enolalabs/sunset/internal/cache"
+	"github.com/enolalabs/sunset/internal/output"
 )
 
 func setupTestProject(t *testing.T) string {

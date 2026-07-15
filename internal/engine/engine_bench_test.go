@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/enolalab/sunset/internal/output"
+	"github.com/enolalabs/sunset/internal/output"
 )
 
 func setupBenchProject(b *testing.B, numFiles int) string {

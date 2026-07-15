@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/enolalab/sunset/internal/engine"
-	"github.com/enolalab/sunset/internal/language"
-	"github.com/enolalab/sunset/internal/output"
+	"github.com/enolalabs/sunset/internal/engine"
+	"github.com/enolalabs/sunset/internal/language"
+	"github.com/enolalabs/sunset/internal/output"
 )
 
 // Version is set at build time via ldflags.

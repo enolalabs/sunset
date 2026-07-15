@@ -9,11 +9,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/enolalab/sunset/internal/cache"
-	"github.com/enolalab/sunset/internal/language"
-	"github.com/enolalab/sunset/internal/output"
-	"github.com/enolalab/sunset/internal/parser"
-	"github.com/enolalab/sunset/internal/scanner"
+	"github.com/enolalabs/sunset/internal/cache"
+	"github.com/enolalabs/sunset/internal/language"
+	"github.com/enolalabs/sunset/internal/output"
+	"github.com/enolalabs/sunset/internal/parser"
+	"github.com/enolalabs/sunset/internal/scanner"
 )
 
 // Config holds engine configuration.

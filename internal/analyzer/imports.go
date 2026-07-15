@@ -2,7 +2,7 @@
 package analyzer
 
 import (
-	"github.com/enolalab/sunset/internal/output"
+	"github.com/enolalabs/sunset/internal/output"
 )
 
 // Import represents a resolved import.

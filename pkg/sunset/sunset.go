@@ -21,8 +21,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/enolalab/sunset/internal/language"
-	"github.com/enolalab/sunset/internal/parser"
+	"github.com/enolalabs/sunset/internal/language"
+	"github.com/enolalabs/sunset/internal/parser"
 )
 
 // FileResult holds the result of parsing a single file.

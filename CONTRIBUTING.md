@@ -5,7 +5,7 @@ Thank you for considering contributing to Sunset! 🌅
 ## Getting Started
 
 ```bash
-git clone https://github.com/enolalab/sunset.git
+git clone https://github.com/enolalabs/sunset.git
 cd sunset
 make build
 make test

@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/enolalab/sunset/internal/parser"
+	"github.com/enolalabs/sunset/internal/parser"
 )
 
 // WriteFileMD renders a parsed file as Markdown and writes it to the output directory.

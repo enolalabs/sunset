@@ -1,4 +1,4 @@
-module github.com/enolalab/sunset
+module github.com/enolalabs/sunset
 
 go 1.26.2
 

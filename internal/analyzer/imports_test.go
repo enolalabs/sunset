@@ -3,7 +3,7 @@ package analyzer
 import (
 	"testing"
 
-	"github.com/enolalab/sunset/internal/output"
+	"github.com/enolalabs/sunset/internal/output"
 )
 
 func TestExtractAndResolve_GoInternal(t *testing.T) {

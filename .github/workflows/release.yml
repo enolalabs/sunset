@@ -555,6 +555,8 @@ jobs:
       && (needs.preflight.outputs.mode == 'absent' || needs.preflight.outputs.mode == 'draft')
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    permissions:
+      contents: write  # required by GitHub API to read draft release data despite being read-only
     steps:
       - name: Checkout exact tag (no persisted credentials)
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

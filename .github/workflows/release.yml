@@ -741,7 +741,6 @@ jobs:
           draft="$(printf '%s' "$release_json" | jq -r '.draft')"
           target="$(printf '%s' "$release_json" | jq -r '.target_commitish')"
           tag_name="$(printf '%s' "$release_json" | jq -r '.tag_name')"
-          notes_digest_actual=""
           if [[ "$draft" != "true" ]]; then
             echo "promote: release $rid is not draft (draft=$draft) — refusing to mutate" >&2
             exit 1
@@ -759,6 +758,27 @@ jobs:
             echo "promote: evidence release_id $evidence_id != current $rid" >&2
             exit 1
           fi
+          # Reassert notes digest.  The release body returned by the API is
+          # normalized exactly as preflight normalized the source notes file
+          # (lines joined with "\n", exactly one trailing "\n") before hashing,
+          # so trailing-newline differences between the file upload and the API
+          # representation cannot cause a false mismatch.
+          expected_notes_digest="$(jq -r '.notes_digest' evidence/draft-evidence.json)"
+          if [[ "$expected_notes_digest" != "$EXPECTED_NOTES_DIGEST" ]]; then
+            echo "promote: evidence notes_digest ($expected_notes_digest) != preflight ($EXPECTED_NOTES_DIGEST)" >&2
+            exit 1
+          fi
+          release_body="$(printf '%s' "$release_json" | jq -r '.body // empty')"
+          notes_tmp="$(mktemp)"
+          printf '%s' "$release_body" | awk 'NR>1{printf "\n"} {printf "%s", $0}' > "$notes_tmp"
+          printf '\n' >> "$notes_tmp"
+          notes_digest_actual="$(sha256sum "$notes_tmp" | awk '{print $1}')"
+          rm -f "$notes_tmp"
+          if [[ "$notes_digest_actual" != "$expected_notes_digest" ]]; then
+            echo "promote: notes digest mismatch: expected $expected_notes_digest, got $notes_digest_actual" >&2
+            exit 1
+          fi
+          echo "promote: notes digest verified"
           # Re-download all six assets, verify names/sizes/digests/checksum bytes.
           work="$(mktemp -d)"
           while IFS=$'\t' read -r name size url; do

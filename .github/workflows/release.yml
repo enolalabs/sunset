@@ -190,7 +190,7 @@ jobs:
           VERSION: ${{ steps.tag.outputs.version }}
         run: |
           set -uo pipefail
-          src=".github/release-notes/${VERSION}.md"
+          src=".github/release-notes/v${VERSION}.md"
           if [[ ! -f "$src" ]]; then
             echo "release notes file not found: $src" >&2
             exit 1

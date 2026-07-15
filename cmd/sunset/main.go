@@ -11,10 +11,8 @@ import (
 	"github.com/enolalabs/sunset/internal/engine"
 	"github.com/enolalabs/sunset/internal/language"
 	"github.com/enolalabs/sunset/internal/output"
+	"github.com/enolalabs/sunset/internal/version"
 )
-
-// Version is set at build time via ldflags.
-var Version = "dev"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -30,7 +28,7 @@ func main() {
 		os.Exit(0)
 	}
 	if cmd == "--version" || cmd == "-v" {
-		fmt.Printf("sunset %s\n", Version)
+		fmt.Printf("sunset %s\n", version.Current())
 		os.Exit(0)
 	}
 
@@ -42,7 +40,7 @@ func main() {
 	case "languages":
 		cmdLanguages()
 	case "version":
-		fmt.Printf("sunset %s\n", Version)
+		fmt.Printf("sunset %s\n", version.Current())
 	case "clean":
 		cmdClean(os.Args[2:])
 	case "help":
@@ -56,7 +54,7 @@ func main() {
 
 func printUsage() {
 	fmt.Println("🌅 Sunset — Codebase Indexer")
-	fmt.Printf("Version: %s\n\n", Version)
+	fmt.Printf("Version: %s\n\n", version.Current())
 	fmt.Println("Usage: sunset <command> [flags]")
 	fmt.Println()
 	fmt.Println("Commands:")

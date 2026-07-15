@@ -7,10 +7,9 @@ import (
 	"sort"
 	"strings"
 	"time"
-)
 
-// Version is the current sunset version for index metadata.
-var Version = "dev"
+	"github.com/enolalabs/sunset/internal/version"
+)
 
 // WriteIndexMD generates the index.md file from a list of FileInfos.
 func WriteIndexMD(files []*FileInfo, projectRoot string, outputDir string) error {
@@ -33,7 +32,7 @@ func buildProjectInfo(files []*FileInfo, root string) *ProjectInfo {
 		Project:       filepath.Base(root),
 		Root:          root,
 		Generated:     time.Now().Format(time.RFC3339),
-		SunsetVersion: Version,
+		SunsetVersion: version.Current(),
 		Languages:     make(map[string]LanguageStat),
 		TotalFiles:    len(files),
 	}

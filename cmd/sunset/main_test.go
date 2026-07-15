@@ -10,9 +10,27 @@ import (
 
 func buildBinary(t *testing.T) string {
 	t.Helper()
+	return buildBinaryWithLdflags(t, "")
+}
+
+// buildBinaryWithVersion builds the sunset binary with the release ldflag
+// that injects version.BuildVersion.
+func buildBinaryWithVersion(t *testing.T, version string) string {
+	t.Helper()
+	ldflag := "-X github.com/enolalabs/sunset/internal/version.BuildVersion=" + version
+	return buildBinaryWithLdflags(t, ldflag)
+}
+
+func buildBinaryWithLdflags(t *testing.T, ldflags string) string {
+	t.Helper()
 	tmp := t.TempDir()
 	binary := filepath.Join(tmp, "sunset")
-	cmd := exec.Command("go", "build", "-o", binary, "./cmd/sunset/")
+	args := []string{"build", "-o", binary}
+	if ldflags != "" {
+		args = append(args, "-ldflags", ldflags)
+	}
+	args = append(args, "./cmd/sunset/")
+	cmd := exec.Command("go", args...)
 	cmd.Dir = findProjectRoot(t)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -181,5 +199,56 @@ func TestCLI_Clean(t *testing.T) {
 
 	if _, err := os.Stat(filepath.Join(tmp, ".sunset")); !os.IsNotExist(err) {
 		t.Error(".sunset should be cleaned")
+	}
+}
+
+func TestCLI_VersionSubcommand_PrintsReleaseVersion(t *testing.T) {
+	bin := buildBinaryWithVersion(t, "1.0.1")
+
+	out, code := runSunset(t, bin, "version")
+	if code != 0 {
+		t.Fatalf("version failed (code %d): %s", code, out)
+	}
+	if !strings.Contains(out, "sunset 1.0.1") {
+		t.Errorf("version output should contain 'sunset 1.0.1', got: %s", out)
+	}
+}
+
+func TestCLI_RootVersionFlag_PrintsReleaseVersion(t *testing.T) {
+	bin := buildBinaryWithVersion(t, "1.0.1")
+
+	out, code := runSunset(t, bin, "--version")
+	if code != 0 {
+		t.Fatalf("--version failed (code %d): %s", code, out)
+	}
+	if !strings.Contains(out, "sunset 1.0.1") {
+		t.Errorf("--version output should contain 'sunset 1.0.1', got: %s", out)
+	}
+}
+
+func TestCLI_Parse_ReleaseVersionWrittenToIndex(t *testing.T) {
+	bin := buildBinaryWithVersion(t, "1.0.1")
+
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "main.go"),
+		[]byte("package main\n\nfunc main() {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	outDir := filepath.Join(t.TempDir(), "out")
+
+	// Flags before the positional path.
+	out, code := runSunset(t, bin, "parse", "--output", outDir, "--no-cache", src)
+	t.Logf("parse output: %s", out)
+	if code != 0 {
+		t.Fatalf("parse failed (code %d): %s", code, out)
+	}
+
+	indexBytes, err := os.ReadFile(filepath.Join(outDir, "index.md"))
+	if err != nil {
+		t.Fatalf("reading index.md: %v", err)
+	}
+	if !strings.Contains(string(indexBytes), "sunset_version: 1.0.1") {
+		t.Errorf("index.md should contain 'sunset_version: 1.0.1', got:\n%s", indexBytes)
 	}
 }

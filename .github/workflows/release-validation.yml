@@ -173,7 +173,7 @@ jobs:
             echo '- cgo:     '"$(go env CGO_ENABLED)"
             echo '- gov:     '"$(go version)"
             echo '- gh:      '"$(gh --version | head -n 1)"
-            echo '- runner:  ${{ matrix.runner }}"
+            echo '- runner:  ${{ matrix.runner }}'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Resolve Go toolchain identity (Windows)

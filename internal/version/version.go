@@ -31,9 +31,9 @@ func Current() string {
 
 // resolve applies the version precedence and normalization.
 //
-//	- A non-empty buildVersion always wins.
-//	- Otherwise mainVersion is used unless it is empty or "(devel)".
-//	- Anything else resolves to "dev".
+//   - A non-empty buildVersion always wins.
+//   - Otherwise mainVersion is used unless it is empty or "(devel)".
+//   - Anything else resolves to "dev".
 //
 // Exactly one leading "v" is stripped from the selected value.
 func resolve(buildVersion, mainVersion string) string {

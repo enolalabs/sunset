@@ -1,0 +1,416 @@
+name: Release Validation
+
+# Read-only pre-tag validation. Triggered manually with a 40-hex commit SHA.
+# Performs every release-quality gate short of producing release artifacts
+# for publication: race tests, vet, tidy, module/active-surface identity,
+# workflow-policy enforcement, and the full native matrix build+package+smoke
+# loop including the canonical install snippets served over loopback HTTP.
+#
+# This workflow NEVER mutates a release, NEVER uses contents:write, and NEVER
+# exposes GH_TOKEN to build/helper/smoke steps.
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Exact 40-hex commit SHA to validate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-validation-${{ github.event.inputs.commit_sha }}
+  cancel-in-progress: false
+
+jobs:
+  validate_preflight:
+    name: Preflight (${{ github.event.inputs.commit_sha }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      commit_sha: ${{ steps.verify_commit.outputs.commit_sha }}
+      short_sha: ${{ steps.verify_commit.outputs.short_sha }}
+    steps:
+      - name: Validate commit_sha input format
+        shell: bash
+        env:
+          INPUT_SHA: ${{ inputs.commit_sha }}
+        run: |
+          set -uo pipefail
+          if ! printf '%s' "$INPUT_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "commit_sha must be exactly 40 lowercase hex characters; got: $INPUT_SHA" >&2
+            exit 1
+          fi
+
+      - name: Checkout exact commit (full history)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require commit reachable from protected main
+        id: verify_commit
+        shell: bash
+        env:
+          INPUT_SHA: ${{ inputs.commit_sha }}
+        run: |
+          set -uo pipefail
+          if ! git merge-base --is-ancestor "$INPUT_SHA" origin/main; then
+            echo "commit $INPUT_SHA is not reachable from protected main" >&2
+            exit 1
+          fi
+          printf 'commit_sha=%s\n' "$INPUT_SHA" >> "$GITHUB_OUTPUT"
+          printf 'short_sha=%s\n' "${INPUT_SHA:0:12}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run race tests
+        shell: bash
+        run: go test -race -count=1 ./...
+
+      - name: Run go vet
+        shell: bash
+        run: go vet ./...
+
+      - name: Check go mod tidy
+        shell: bash
+        run: |
+          set -uo pipefail
+          go mod tidy
+          if ! git diff --exit-code go.mod go.sum; then
+            echo "go.mod/go.sum not tidy after 'go mod tidy'" >&2
+            exit 1
+          fi
+
+      - name: Module identity
+        shell: bash
+        run: |
+          set -uo pipefail
+          first="$(head -n 1 go.mod)"
+          if [[ "$first" != "module github.com/enolalabs/sunset" ]]; then
+            echo "module identity mismatch: expected 'module github.com/enolalabs/sunset', got '$first'" >&2
+            exit 1
+          fi
+
+      - name: Active-surface identity
+        shell: bash
+        run: |
+          set -uo pipefail
+          out="$(go run ./cmd/sunset languages 2>/dev/null)"
+          for L in go javascript typescript python; do
+            if ! grep -qw "$L" <<<"$out"; then
+              echo "active-surface mismatch: language '$L' missing from 'sunset languages'" >&2
+              exit 1
+            fi
+          done
+
+      - name: Helper tests (POSIX)
+        shell: bash
+        run: bash .github/scripts/release/test-helpers.sh
+
+      - name: Snippet consistency
+        shell: bash
+        run: bash .github/scripts/release/check-doc-snippets.sh
+
+      - name: Workflow policy tests
+        shell: bash
+        run: bash .github/scripts/release/test-workflow-policy.sh
+
+      - name: Validate this workflow rejects --reject-write
+        shell: bash
+        env:
+          THIS_FILE: ${{ github.workspace }}/.github/workflows/release-validation.yml
+          RELEASE_FILE: ${{ github.workspace }}/.github/workflows/release.yml
+        run: |
+          set -uo pipefail
+          bash .github/scripts/release/verify-workflow-policy.sh --reject-write "$THIS_FILE"
+          bash .github/scripts/release/verify-workflow-policy.sh "$RELEASE_FILE"
+
+  validate_native:
+    name: Native (${{ matrix.os }}/${{ matrix.arch }})
+    needs: validate_preflight
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Exact five-row native matrix. Each row pins its runner image.
+          - {os: linux,   arch: amd64, runner: ubuntu-24.04,     executable: sunset,     archive_ext: tar.gz, snippet: install-linux.sh}
+          - {os: linux,   arch: arm64, runner: ubuntu-24.04-arm, executable: sunset,     archive_ext: tar.gz, snippet: install-linux.sh}
+          - {os: darwin,  arch: amd64, runner: macos-15-intel,   executable: sunset,     archive_ext: tar.gz, snippet: install-macos.sh}
+          - {os: darwin,  arch: arm64, runner: macos-15,         executable: sunset,     archive_ext: tar.gz, snippet: install-macos.sh}
+          - {os: windows, arch: amd64, runner: windows-2025,     executable: sunset.exe, archive_ext: zip,    snippet: install-windows.ps1}
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.validate_preflight.outputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+
+      - name: Resolve Go toolchain identity (POSIX)
+        if: matrix.os != 'windows'
+        id: posix_identity
+        shell: bash
+        run: |
+          set -uo pipefail
+          {
+            echo "## Go toolchain identity (${{ matrix.os }}/${{ matrix.arch }})"
+            echo
+            echo '- hostos:  '"$(go env GOHOSTOS)"
+            echo '- hostarch: '"$(go env GOHOSTARCH)"
+            echo '- cgo:     '"$(go env CGO_ENABLED)"
+            echo '- gov:     '"$(go version)"
+            echo '- gh:      '"$(gh --version | head -n 1)"
+            echo '- runner:  ${{ matrix.runner }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Resolve Go toolchain identity (Windows)
+        if: matrix.os == 'windows'
+        id: win_identity
+        shell: pwsh
+        run: |
+          $summary = @"
+          ## Go toolchain identity (${{ matrix.os }}/${{ matrix.arch }})
+
+          - hostos:  $(go env GOHOSTOS)
+          - hostarch: $(go env GOHOSTARCH)
+          - cgo:     $(go env CGO_ENABLED)
+          - gov:     $(go version)
+          - gh:      $((gh --version | Select-Object -First 1))
+          - runner:  ${{ matrix.runner }}
+          - gcc:     $((Get-Command gcc -ErrorAction SilentlyContinue).Source)
+          - objdump: $((Get-Command objdump -ErrorAction SilentlyContinue).Source)
+          "@
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary
+
+      - name: Assert host toolchain (POSIX)
+        if: matrix.os != 'windows'
+        shell: bash
+        run: |
+          set -uo pipefail
+          [[ "$(go env GOHOSTOS)"   == "${{ matrix.os }}"   ]] || { echo "GOHOSTOS mismatch: expected ${{ matrix.os }}, got $(go env GOHOSTOS)" >&2; exit 1; }
+          [[ "$(go env GOHOSTARCH)" == "${{ matrix.arch }}" ]] || { echo "GOHOSTARCH mismatch: expected ${{ matrix.arch }}, got $(go env GOHOSTARCH)" >&2; exit 1; }
+          [[ "$(go env CGO_ENABLED)" == "1"                 ]] || { echo "CGO_ENABLED must be 1, got $(go env CGO_ENABLED)" >&2; exit 1; }
+
+      - name: Assert host toolchain (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          if ((go env GOHOSTOS) -ne '${{ matrix.os }}') {
+            Write-Error "GOHOSTOS mismatch: expected ${{ matrix.os }}, got $(go env GOHOSTOS)"; exit 1
+          }
+          if ((go env GOHOSTARCH) -ne '${{ matrix.arch }}') {
+            Write-Error "GOHOSTARCH mismatch: expected ${{ matrix.arch }}, got $(go env GOHOSTARCH)"; exit 1
+          }
+          if ((go env CGO_ENABLED) -ne '1') {
+            Write-Error "CGO_ENABLED must be 1, got $(go env CGO_ENABLED)"; exit 1
+          }
+
+      - name: Build binary (POSIX)
+        # BuildVersion is hardcoded to 1.0.1 because this workflow validates
+        # the specific v1.0.1 release *before* the tag is created (pre-tag
+        # validation). The real release.yml uses needs.preflight.outputs.version
+        # instead. When promoting a new version, update all v1.0.1 literals in
+        # this workflow (ldflags, package-and-verify invocations, snippet paths).
+        if: matrix.os != 'windows'
+        env:
+          CGO_ENABLED: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          go build -trimpath \
+            -ldflags "-s -w -X github.com/enolalabs/sunset/internal/version.BuildVersion=1.0.1" \
+            -o build/sunset \
+            ./cmd/sunset/
+
+      - name: Build binary (Windows)
+        if: matrix.os == 'windows'
+        env:
+          CGO_ENABLED: "1"
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path build -Force | Out-Null
+          go build -trimpath `
+            -ldflags "-s -w -X github.com/enolalabs/sunset/internal/version.BuildVersion=1.0.1" `
+            -o build/sunset.exe `
+            ./cmd/sunset/
+
+      - name: Package + extract + smoke (POSIX)
+        if: matrix.os != 'windows'
+        id: pkg_posix
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p archives
+          archive_path="$(bash .github/scripts/release/package-and-verify.sh \
+              build/sunset 1.0.1 ${{ matrix.os }} ${{ matrix.arch }} testdata/go-sample archives)"
+          archive_name="$(basename "$archive_path")"
+          # Single-archive checksums.txt for the loopback snippet run.
+          ( cd archives && sha256sum "$archive_name" > checksums.txt )
+          printf 'archive_name=%s\n' "$archive_name" >> "$GITHUB_OUTPUT"
+          printf 'archive_path=%s\n' "$archive_path" >> "$GITHUB_OUTPUT"
+          printf 'checksum=%s\n'  "$(awk '{print $1}' archives/checksums.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Package + extract + smoke (Windows)
+        if: matrix.os == 'windows'
+        id: pkg_win
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path archives -Force | Out-Null
+          $archive = & .github/scripts/release/package-and-verify.ps1 `
+            -Executable build/sunset.exe `
+            -Version 1.0.1 `
+            -Fixture testdata/go-sample `
+            -ArchiveOutputDir archives
+          if ($LASTEXITCODE -ne 0) { Write-Error "package-and-verify.ps1 failed"; exit 1 }
+          $name = Split-Path $archive -Leaf
+          $hash = (Get-FileHash -Algorithm SHA256 "archives/$name").Hash.ToLower()
+          "$hash  $name" | Out-File -FilePath archives/checksums.txt -Encoding ascii -NoNewline
+          Add-Content -Path archives/checksums.txt -Value ""
+          "archive_name=$name" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding ascii -Append
+          "archive_path=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding ascii -Append
+          "checksum=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding ascii -Append
+
+      - name: Run PowerShell helper tests (Windows only)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          & .github/scripts/release/test-helpers.ps1
+
+      - name: Serve archive over loopback HTTP and run canonical snippet (POSIX)
+        if: matrix.os != 'windows'
+        shell: bash
+        env:
+          ARCHIVE_NAME: ${{ steps.pkg_posix.outputs.archive_name }}
+        run: |
+          set -uo pipefail
+          port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+          python3 -m http.server "$port" --directory archives >/tmp/httpd.log 2>&1 &
+          server_pid=$!
+          trap 'kill $server_pid 2>/dev/null || true' EXIT
+          # Wait for the server to come up.
+          for _ in $(seq 1 20); do
+            if curl -fsS "http://127.0.0.1:${port}/checksums.txt" >/dev/null 2>&1; then break; fi
+            sleep 0.2
+          done
+          install_dir="$(mktemp -d)"
+          snippet="docs/snippets/v1.0.1/${{ matrix.snippet }}"
+          SUNSET_BASE_URL="http://127.0.0.1:${port}" \
+            SUNSET_INSTALL_DIR="$install_dir" \
+            bash "$snippet" "${{ matrix.arch }}"
+          # The snippet ends by running "<install_dir>/sunset version" which
+          # must print "sunset 1.0.1".
+          "$install_dir/sunset" version
+
+      - name: Serve archive over loopback HTTP and run canonical snippet (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        env:
+          ARCHIVE_NAME: ${{ steps.pkg_win.outputs.archive_name }}
+        run: |
+          # Find a free loopback TCP port (same trick as the POSIX row).
+          $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+          $listener.Start()
+          $port = ($listener.LocalEndpoint).Port
+          $listener.Stop()
+          $dir = (Resolve-Path archives).Path
+          $server = Start-Job -ScriptBlock {
+            param($dir, $port)
+            Push-Location $dir
+            python -m http.server $port
+            Pop-Location
+          } -ArgumentList $dir, $port
+          try {
+            for ($i = 0; $i -lt 20; $i++) {
+              try {
+                Invoke-WebRequest -Uri "http://127.0.0.1:${port}/checksums.txt" -UseBasicParsing -ErrorAction Stop | Out-Null
+                break
+              } catch { Start-Sleep -Milliseconds 200 }
+            }
+            $install_dir = Join-Path $env:TEMP "sunset-validate-$$"
+            New-Item -ItemType Directory -Path $install_dir -Force | Out-Null
+            $env:SUNSET_BASE_URL = "http://127.0.0.1:${port}"
+            $env:SUNSET_INSTALL_DIR = $install_dir
+            & ".\docs\snippets\v1.0.1\${{ matrix.snippet }}"
+            & "$install_dir\sunset.exe" version
+          } finally {
+            Stop-Job $server -ErrorAction SilentlyContinue
+            Remove-Job $server -ErrorAction SilentlyContinue
+          }
+
+      - name: Record row evidence
+        if: always()
+        shell: bash
+        env:
+          OS: ${{ matrix.os }}
+          ARCH: ${{ matrix.arch }}
+          RUNNER: ${{ matrix.runner }}
+          ARCHIVE_NAME_POSIX: ${{ steps.pkg_posix.outputs.archive_name }}
+          ARCHIVE_NAME_WIN: ${{ steps.pkg_win.outputs.archive_name }}
+          CHECKSUM_POSIX: ${{ steps.pkg_posix.outputs.checksum }}
+          CHECKSUM_WIN: ${{ steps.pkg_win.outputs.checksum }}
+        run: |
+          set -uo pipefail
+          {
+            echo "## Native row evidence ($OS/$ARCH)"
+            echo
+            echo "- runner:       $RUNNER"
+            echo "- go hostos:    $(go env GOHOSTOS)"
+            echo "- go hostarch:  $(go env GOHOSTARCH)"
+            echo "- cgo:          $(go env CGO_ENABLED)"
+            echo "- go version:   $(go version)"
+            echo "- archive:      ${ARCHIVE_NAME_POSIX}${ARCHIVE_NAME_WIN}"
+            echo "- checksum:     ${CHECKSUM_POSIX}${CHECKSUM_WIN}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evidence artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: evidence-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            archives/
+          retention-days: 3
+          if-no-files-found: warn
+
+  summary:
+    name: Validation summary
+    needs: [validate_preflight, validate_native]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Record workflow summary
+        shell: bash
+        env:
+          INPUT_SHA: ${{ inputs.commit_sha }}
+          SHORT_SHA: ${{ needs.validate_preflight.outputs.short_sha }}
+          PREFLIGHT_RESULT: ${{ needs.validate_preflight.result }}
+          NATIVE_RESULT: ${{ needs.validate_native.result }}
+        run: |
+          set -uo pipefail
+          {
+            echo "## Release Validation summary"
+            echo
+            echo "- input commit:      \`$INPUT_SHA\`"
+            echo "- short SHA:         \`$SHORT_SHA\`"
+            echo "- preflight result:  $PREFLIGHT_RESULT"
+            echo "- native result:     $NATIVE_RESULT"
+            echo
+            echo "Five host/toolchain identities, helper results, snippet"
+            echo "results, archive names and checksums are recorded on each"
+            echo "matrix row's job summary above."
+          } >> "$GITHUB_STEP_SUMMARY"

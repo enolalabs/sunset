@@ -1,113 +1,910 @@
 name: Release
 
+# Staged release state machine for native v1.0.1 artifacts.
+#
+# Triggered only by an exact-SemVer `v*` tag push. The preflight job peels
+# the annotated tag, requires its commit to be reachable from protected
+# `main`, and queries the GitHub releases API to determine the release mode:
+#
+#   absent    — no release exists at this tag (authoritative 404)
+#   draft     — release exists in draft state
+#   published — release exists and is public
+#
+# Auth/rate-limit/network/parse/inconsistent responses fail closed.
+#
+# Only the write-capable jobs (stage_draft, promote) carry `contents: write`,
+# and only the `promote` job uses the protected `release` environment. Every
+# checkout is pinned, fully fetched when needed, and uses
+# `persist-credentials: false`. Every `gh` call uses a step-scoped
+# `GH_TOKEN: ${{ github.token }}` matching the minimum job permission and is
+# never exposed to build/helper/smoke steps.
+
 on:
   push:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build:
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+      peeled_commit: ${{ steps.peel.outputs.peeled_commit }}
+      mode: ${{ steps.state.outputs.mode }}
+      release_id: ${{ steps.state.outputs.release_id }}
+      draft: ${{ steps.state.outputs.draft }}
+      target: ${{ steps.state.outputs.target }}
+      notes_digest: ${{ steps.notes.outputs.notes_digest }}
+    steps:
+      - name: Validate exact SemVer tag
+        id: tag
+        shell: bash
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -uo pipefail
+          tag="$REF_NAME"
+          if ! printf '%s' "$tag" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+            echo "tag '$tag' is not exact SemVer (expected vX.Y.Z with no pre-release/build suffixes)" >&2
+            exit 1
+          fi
+          version="${tag#v}"
+          printf 'tag=%s\n'     "$tag"     >> "$GITHUB_OUTPUT"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout exact tag (full history)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Peel tag and verify reachability from protected main
+        id: peel
+        shell: bash
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -uo pipefail
+          peeled="$GITHUB_SHA"
+          if ! git merge-base --is-ancestor "$peeled" origin/main; then
+            echo "peeled commit $peeled is not reachable from protected main" >&2
+            exit 1
+          fi
+          printf 'peeled_commit=%s\n' "$peeled" >> "$GITHUB_OUTPUT"
+
+      - name: Query release state (mode/id/draft/target)
+        id: state
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -uo pipefail
+          hdr="$(mktemp)"
+          gh api -i "repos/${REPO}/releases/tags/${TAG}" >"$hdr" 2>/dev/null || true
+          code="$(awk 'NR==1{print $2; exit}' "$hdr")"
+          case "$code" in
+            200)
+              body="$(awk 'BEGIN{h=1} h==0 {print} /^\r?$/{h=0}' "$hdr")"
+              rid="$(printf '%s' "$body" | jq -r '.id // empty')"
+              draft="$(printf '%s' "$body" | jq -r '.draft // empty')"
+              target="$(printf '%s' "$body" | jq -r '.target_commitish // empty')"
+              tag_of_release="$(printf '%s' "$body" | jq -r '.tag_name // empty')"
+              if [[ -z "$rid" || -z "$draft" || -z "$target" || -z "$tag_of_release" ]]; then
+                echo "release record is missing required fields (id/draft/target/tag_name)" >&2
+                rm -f "$hdr"; exit 1
+              fi
+              if [[ "$tag_of_release" != "$TAG" ]]; then
+                echo "release tag_name '$tag_of_release' != requested '$TAG'" >&2
+                rm -f "$hdr"; exit 1
+              fi
+              if [[ "$draft" == "true" ]]; then
+                mode=draft
+              else
+                mode=published
+              fi
+              ;;
+            404)
+              mode=absent; rid=""; draft=""; target=""
+              ;;
+            ""|*)
+              echo "gh api returned HTTP ${code:-<empty>} — failing closed (auth/rate/network/parse)" >&2
+              rm -f "$hdr"; exit 1
+              ;;
+          esac
+          rm -f "$hdr"
+          printf 'mode=%s\n'        "$mode"     >> "$GITHUB_OUTPUT"
+          printf 'release_id=%s\n'  "${rid:-}"  >> "$GITHUB_OUTPUT"
+          printf 'draft=%s\n'       "${draft:-}" >> "$GITHUB_OUTPUT"
+          printf 'target=%s\n'      "${target:-}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run race tests
+        shell: bash
+        run: go test -race -count=1 ./...
+
+      - name: Run go vet
+        shell: bash
+        run: go vet ./...
+
+      - name: Check go mod tidy
+        shell: bash
+        run: |
+          set -uo pipefail
+          go mod tidy
+          if ! git diff --exit-code go.mod go.sum; then
+            echo "go.mod/go.sum not tidy" >&2
+            exit 1
+          fi
+
+      - name: Module identity
+        shell: bash
+        run: |
+          set -uo pipefail
+          first="$(head -n 1 go.mod)"
+          if [[ "$first" != "module github.com/enolalabs/sunset" ]]; then
+            echo "module identity mismatch: expected 'module github.com/enolalabs/sunset', got '$first'" >&2
+            exit 1
+          fi
+
+      - name: Active-surface identity
+        shell: bash
+        run: |
+          set -uo pipefail
+          out="$(go run ./cmd/sunset languages 2>/dev/null)"
+          for L in go javascript typescript python; do
+            if ! grep -qw "$L" <<<"$out"; then
+              echo "active-surface mismatch: language '$L' missing from 'sunset languages'" >&2
+              exit 1
+            fi
+          done
+
+      - name: Workflow policy tests
+        shell: bash
+        run: bash .github/scripts/release/test-workflow-policy.sh
+
+      - name: Snippet consistency
+        shell: bash
+        run: bash .github/scripts/release/check-doc-snippets.sh
+
+      - name: Stage normalized release notes + digest
+        id: notes
+        shell: bash
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -uo pipefail
+          src=".github/release-notes/${VERSION}.md"
+          if [[ ! -f "$src" ]]; then
+            echo "release notes file not found: $src" >&2
+            exit 1
+          fi
+          mkdir -p stage
+          awk 'NR>1{printf "\n"} {printf "%s", $0}' "$src" > stage/release-notes.md
+          printf '\n' >> stage/release-notes.md
+          sha256sum stage/release-notes.md | awk '{print $1}' > stage/release-notes.sha256
+          printf 'notes_digest=%s\n' "$(cat stage/release-notes.sha256)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload notes artifact (bounded internal)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-notes
+          path: stage/
+          retention-days: 3
+          if-no-files-found: error
+
+  build_native:
     name: Build (${{ matrix.os }}/${{ matrix.arch }})
+    needs: preflight
+    if: needs.preflight.result == 'success' && needs.preflight.outputs.mode != 'published'
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux amd64
-          - os: linux
-            arch: amd64
-            runner: ubuntu-latest
-            binary: sunset
-          # Linux arm64
-          - os: linux
-            arch: arm64
-            runner: ubuntu-24.04-arm
-            binary: sunset
-          # macOS arm64 (Apple Silicon — also runs amd64 via Rosetta 2)
-          - os: darwin
-            arch: arm64
-            runner: macos-latest
-            binary: sunset
-
+          # Exact five-row native matrix.
+          - {os: linux,   arch: amd64, runner: ubuntu-24.04,     executable: sunset,     archive_ext: tar.gz, archive_kind: posix,    artifact_name: sunset-linux-amd64,    snippet: install-linux.sh}
+          - {os: linux,   arch: arm64, runner: ubuntu-24.04-arm, executable: sunset,     archive_ext: tar.gz, archive_kind: posix,    artifact_name: sunset-linux-arm64,    snippet: install-linux.sh}
+          - {os: darwin,  arch: amd64, runner: macos-15-intel,   executable: sunset,     archive_ext: tar.gz, archive_kind: posix,    artifact_name: sunset-darwin-amd64,   snippet: install-macos.sh}
+          - {os: darwin,  arch: arm64, runner: macos-15,         executable: sunset,     archive_ext: tar.gz, archive_kind: posix,    artifact_name: sunset-darwin-arm64,   snippet: install-macos.sh}
+          - {os: windows, arch: amd64, runner: windows-2025,     executable: sunset.exe, archive_ext: zip,    archive_kind: windows,  artifact_name: sunset-windows-amd64,  snippet: install-windows.ps1}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout exact tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.preflight.outputs.tag }}
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version-file: "go.mod"
+          go-version-file: go.mod
 
-      - name: Get version
-        id: version
+      - name: Assert host toolchain (POSIX)
+        if: matrix.archive_kind == 'posix'
         shell: bash
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+        run: |
+          set -uo pipefail
+          [[ "$(go env GOHOSTOS)"   == "${{ matrix.os }}"   ]] || { echo "GOHOSTOS mismatch: expected ${{ matrix.os }}, got $(go env GOHOSTOS)" >&2; exit 1; }
+          [[ "$(go env GOHOSTARCH)" == "${{ matrix.arch }}" ]] || { echo "GOHOSTARCH mismatch: expected ${{ matrix.arch }}, got $(go env GOHOSTARCH)" >&2; exit 1; }
+          [[ "$(go env CGO_ENABLED)" == "1"                 ]] || { echo "CGO_ENABLED must be 1, got $(go env CGO_ENABLED)" >&2; exit 1; }
 
-      - name: Build binary
+      - name: Assert host toolchain (Windows)
+        if: matrix.archive_kind == 'windows'
+        shell: pwsh
+        run: |
+          if ((go env GOHOSTOS) -ne '${{ matrix.os }}')   { Write-Error "GOHOSTOS mismatch"; exit 1 }
+          if ((go env GOHOSTARCH) -ne '${{ matrix.arch }}') { Write-Error "GOHOSTARCH mismatch"; exit 1 }
+          if ((go env CGO_ENABLED) -ne '1')               { Write-Error "CGO_ENABLED must be 1"; exit 1 }
+
+      - name: Record host toolchain identity (POSIX)
+        if: matrix.archive_kind == 'posix'
         shell: bash
+        run: |
+          {
+            echo "## Build identity (${{ matrix.os }}/${{ matrix.arch }})"
+            echo
+            echo "- runner:    ${{ matrix.runner }}"
+            echo "- hostos:    $(go env GOHOSTOS)"
+            echo "- hostarch:  $(go env GOHOSTARCH)"
+            echo "- cgo:       $(go env CGO_ENABLED)"
+            echo '- gov:       '"$(go version)"
+            echo '- gh:        '"$(gh --version | head -n 1)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record host toolchain identity (Windows)
+        if: matrix.archive_kind == 'windows'
+        shell: pwsh
+        run: |
+          $summary = @"
+          ## Build identity (${{ matrix.os }}/${{ matrix.arch }})
+
+          - runner:    ${{ matrix.runner }}
+          - hostos:    $(go env GOHOSTOS)
+          - hostarch:  $(go env GOHOSTARCH)
+          - cgo:       $(go env CGO_ENABLED)
+          - gov:       $(go version)
+          - gh:        $((gh --version | Select-Object -First 1))
+          - gcc:       $((Get-Command gcc -ErrorAction SilentlyContinue).Source)
+          - objdump:   $((Get-Command objdump -ErrorAction SilentlyContinue).Source)
+          "@
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary
+
+      - name: Build release binary (POSIX)
+        if: matrix.archive_kind == 'posix'
         env:
           CGO_ENABLED: "1"
-          GOOS: ${{ matrix.os }}
-          GOARCH: ${{ matrix.arch }}
+        shell: bash
         run: |
+          set -euo pipefail
+          mkdir -p build
           go build -trimpath \
-            -ldflags "-s -w -X main.Version=${{ steps.version.outputs.version }}" \
-            -o ${{ matrix.binary }} \
+            -ldflags "-s -w -X github.com/enolalabs/sunset/internal/version.BuildVersion=${{ needs.preflight.outputs.version }}" \
+            -o build/sunset \
             ./cmd/sunset/
 
-      - name: Package
-        shell: bash
+      - name: Build release binary (Windows)
+        if: matrix.archive_kind == 'windows'
+        env:
+          CGO_ENABLED: "1"
+        shell: pwsh
         run: |
-          ARCHIVE="sunset_${{ steps.version.outputs.version }}_${{ matrix.os }}_${{ matrix.arch }}.tar.gz"
-          tar czf "$ARCHIVE" ${{ matrix.binary }}
-          echo "ARCHIVE=$ARCHIVE" >> $GITHUB_ENV
+          New-Item -ItemType Directory -Path build -Force | Out-Null
+          go build -trimpath `
+            -ldflags "-s -w -X github.com/enolalabs/sunset/internal/version.BuildVersion=${{ needs.preflight.outputs.version }}" `
+            -o build/sunset.exe `
+            ./cmd/sunset/
 
-      - name: Generate checksum
+      - name: Package + extract + smoke (POSIX)
+        if: matrix.archive_kind == 'posix'
+        id: pkg_posix
         shell: bash
         run: |
-          if [[ "${{ matrix.os }}" == "darwin" ]]; then
-            shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
-          else
-            sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+          set -uo pipefail
+          mkdir -p archives
+          archive_path="$(bash .github/scripts/release/package-and-verify.sh \
+              build/sunset ${{ needs.preflight.outputs.version }} ${{ matrix.os }} ${{ matrix.arch }} testdata/go-sample archives)"
+          archive_name="$(basename "$archive_path")"
+          printf 'archive_name=%s\n' "$archive_name" >> "$GITHUB_OUTPUT"
+          # Per-row checksums.txt is intentionally NOT created here. Each row
+          # uploads only its archive artifact; stage_draft recomputes the
+          # canonical checksums.txt from the final archive bytes (the single
+          # source of truth). Creating per-row checksums.txt files would
+          # collide under download-artifact merge-multiple and silently drop
+          # four of the five checksum lines.
+
+      - name: Package + extract + smoke (Windows)
+        if: matrix.archive_kind == 'windows'
+        id: pkg_win
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path archives -Force | Out-Null
+          $archive = & .github/scripts/release/package-and-verify.ps1 `
+            -Executable build/sunset.exe `
+            -Version ${{ needs.preflight.outputs.version }} `
+            -Fixture testdata/go-sample `
+            -ArchiveOutputDir archives
+          if ($LASTEXITCODE -ne 0) { Write-Error "package-and-verify.ps1 failed"; exit 1 }
+          $name = Split-Path $archive -Leaf
+          # Per-row checksums.txt is intentionally NOT created here. Each row
+          # uploads only its archive artifact; stage_draft recomputes the
+          # canonical checksums.txt from the final archive bytes.
+          "archive_name=$name" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding ascii -Append
+
+      - name: Upload tag/target-named archive artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: archives/
+          retention-days: 3
+          if-no-files-found: error
+
+  stage_draft:
+    name: Stage draft release
+    needs: [preflight, build_native]
+    if: >
+      needs.preflight.result == 'success'
+      && needs.build_native.result == 'success'
+      && (needs.preflight.outputs.mode == 'absent' || needs.preflight.outputs.mode == 'draft')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download notes artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-notes
+          path: notes/
+
+      - name: Verify notes digest
+        shell: bash
+        env:
+          EXPECTED: ${{ needs.preflight.outputs.notes_digest }}
+        run: |
+          set -uo pipefail
+          actual="$(sha256sum notes/release-notes.md | awk '{print $1}')"
+          if [[ "$actual" != "$EXPECTED" ]]; then
+            echo "notes digest mismatch: expected $EXPECTED, got $actual" >&2
+            exit 1
           fi
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Download all native build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: sunset-${{ matrix.os }}-${{ matrix.arch }}
-          path: |
-            ${{ env.ARCHIVE }}
-            ${{ env.ARCHIVE }}.sha256
-
-  release:
-    name: Create Release
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Get version
-        id: version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
+          pattern: sunset-*
           merge-multiple: true
+          path: dist/
 
-      - name: Generate combined checksums
+      - name: Compose canonical checksums.txt
+        shell: bash
         run: |
-          cd dist
-          cat *.sha256 > checksums.txt
-          cat checksums.txt
+          set -uo pipefail
+          mkdir -p release-assets
+          # Move the five archives to release-assets/, rejecting duplicate names.
+          shopt -s nullglob
+          declare -A seen
+          for f in dist/*.tar.gz dist/*.zip; do
+            name="$(basename "$f")"
+            if [[ -n "${seen[$name]+present}" ]]; then
+              echo "duplicate archive name across matrix rows: $name" >&2
+              exit 1
+            fi
+            seen[$name]=1
+            cp "$f" "release-assets/$name"
+          done
+          shopt -u nullglob
+          # Recompute checksums from the final archive bytes in one place.
+          # This is the single source of truth for the downloadable assets and
+          # avoids the per-row checksums.txt collision that occurs when
+          # download-artifact merges five single-row checksums.txt files into
+          # one directory with merge-multiple: true.
+          ( cd release-assets && sha256sum *.tar.gz *.zip | sort -k2 > checksums.txt )
+          # Sanity: exactly 5 archives.
+          count="$(ls -1 release-assets/*.tar.gz release-assets/*.zip 2>/dev/null | wc -l | tr -d ' ')"
+          if [[ "$count" -ne 5 ]]; then
+            echo "expected 5 archives, found $count" >&2
+            exit 1
+          fi
+          # Every archive has exactly one matching checksum line.
+          for f in release-assets/*.tar.gz release-assets/*.zip; do
+            name="$(basename "$f")"
+            n="$(grep -cF "$name" release-assets/checksums.txt || true)"
+            if [[ "$n" -ne 1 ]]; then
+              echo "checksum entry count for $name is $n (expected 1)" >&2
+              exit 1
+            fi
+          done
+          ls -la release-assets/
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Re-query release state, verify draftable
+        id: restate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          EXPECTED_MODE: ${{ needs.preflight.outputs.mode }}
+          EXPECTED_ID: ${{ needs.preflight.outputs.release_id }}
+        run: |
+          set -uo pipefail
+          hdr="$(mktemp)"
+          gh api -i "repos/${REPO}/releases/tags/${TAG}" >"$hdr" 2>/dev/null || true
+          code="$(awk 'NR==1{print $2; exit}' "$hdr")"
+          case "$code" in
+            200)
+              body="$(awk 'BEGIN{h=1} h==0 {print} /^\r?$/{h=0}' "$hdr")"
+              rid="$(printf '%s' "$body" | jq -r '.id // empty')"
+              draft="$(printf '%s' "$body" | jq -r '.draft // empty')"
+              if [[ "$draft" == "true" ]]; then mode=draft; else mode=published; fi
+              ;;
+            404)
+              mode=absent; rid=""; draft=""
+              ;;
+            *)
+              echo "stage_draft: re-query failed with HTTP $code — aborting, fail closed" >&2
+              rm -f "$hdr"; exit 1
+              ;;
+          esac
+          rm -f "$hdr"
+          # Invariants: published mode is never write-reachable (gated by `if:`).
+          # In absent mode: require still absent. In draft mode: require same
+          # recorded ID still in draft.
+          if [[ "$EXPECTED_MODE" == "absent" && "$mode" != "absent" ]]; then
+            echo "stage_draft: expected absent, found $mode (release $rid) — aborting" >&2
+            exit 1
+          fi
+          if [[ "$EXPECTED_MODE" == "draft" ]]; then
+            if [[ "$mode" != "draft" ]]; then
+              echo "stage_draft: expected draft, found $mode — aborting" >&2
+              exit 1
+            fi
+            if [[ -n "$EXPECTED_ID" && "$rid" != "$EXPECTED_ID" ]]; then
+              echo "stage_draft: draft ID changed from $EXPECTED_ID to $rid — aborting" >&2
+              exit 1
+            fi
+          fi
+          printf 'current_id=%s\n' "${rid:-}" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update draft release
+        id: create
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+          CURRENT_ID: ${{ steps.restate.outputs.current_id }}
+          TARGET_COMMIT: ${{ needs.preflight.outputs.peeled_commit }}
+        run: |
+          set -uo pipefail
+          if [[ -z "$CURRENT_ID" ]]; then
+            # Absent: create new draft.
+            rid="$(gh api --method POST "repos/${REPO}/releases" \
+              -f tag_name="$TAG" \
+              -f target_commitish="$TARGET_COMMIT" \
+              -f name="Sunset v${VERSION}" \
+              -F draft=true \
+              -F prerelease=false \
+              --jq '.id')"
+          else
+            rid="$CURRENT_ID"
+          fi
+          printf 'release_id=%s\n' "$rid" >> "$GITHUB_OUTPUT"
+
+      - name: Delete pre-existing assets on verified draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ steps.create.outputs.release_id }}
+        run: |
+          set -uo pipefail
+          existing="$(gh api "repos/${REPO}/releases/${RELEASE_ID}/assets" --jq '.[].id' 2>/dev/null || true)"
+          for aid in $existing; do
+            gh api --method DELETE "repos/${REPO}/releases/assets/${aid}" >/dev/null
+          done
+
+      - name: Upload exact six-file set
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -uo pipefail
+          gh release upload "$TAG" release-assets/* \
+            --clobber \
+            --repo "$REPO"
+
+      - name: Attach normalized release notes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -uo pipefail
+          gh release edit "$TAG" --notes-file notes/release-notes.md --repo "$REPO"
+
+  verify_draft:
+    name: Verify draft release
+    needs: [preflight, stage_draft]
+    if: >
+      needs.preflight.result == 'success'
+      && needs.stage_draft.result == 'success'
+      && (needs.preflight.outputs.mode == 'absent' || needs.preflight.outputs.mode == 'draft')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact tag (no persisted credentials)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          name: Sunset v${{ steps.version.outputs.version }}
-          generate_release_notes: true
-          files: |
-            dist/*.tar.gz
-            dist/checksums.txt
+          ref: ${{ needs.preflight.outputs.tag }}
+          persist-credentials: false
+
+      - name: Set up Go (cache disabled)
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Export unique empty caches
+        shell: bash
+        run: |
+          set -uo pipefail
+          cache_dir="$(mktemp -d)"
+          export GOCACHE="$cache_dir/gocache"
+          export GOMODCACHE="$cache_dir/gomodcache"
+          export GOBIN="$cache_dir/gobin"
+          mkdir -p "$GOCACHE" "$GOMODCACHE" "$GOBIN"
+          # Persist for subsequent steps via $GITHUB_ENV.
+          printf 'GOCACHE=%s\n'    "$GOCACHE"    >> "$GITHUB_ENV"
+          printf 'GOMODCACHE=%s\n' "$GOMODCACHE" >> "$GITHUB_ENV"
+          printf 'GOBIN=%s\n'      "$GOBIN"      >> "$GITHUB_ENV"
+
+      - name: Download draft assets via API
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -uo pipefail
+          mkdir -p draft-assets
+          assets_json="$(gh api "repos/${REPO}/releases/tags/${TAG}" --jq '.assets[] | "\(.name)\t\(.size)\t\(.url)"')"
+          if [[ -z "$assets_json" ]]; then
+            echo "no assets on draft release $TAG" >&2
+            exit 1
+          fi
+          while IFS=$'\t' read -r name size url; do
+            gh api "$url" > "draft-assets/$name"
+            actual_size="$(wc -c < "draft-assets/$name" | tr -d ' ')"
+            if [[ "$actual_size" != "$size" ]]; then
+              echo "asset $name size mismatch: expected $size, got $actual_size" >&2
+              exit 1
+            fi
+          done <<< "$assets_json"
+          ls -la draft-assets/
+
+      - name: Verify asset checksums
+        shell: bash
+        run: |
+          set -uo pipefail
+          ( cd draft-assets && sha256sum -c checksums.txt )
+          # Require the exact six-file set.
+          count_archives="$(ls -1 draft-assets/*.tar.gz draft-assets/*.zip 2>/dev/null | wc -l | tr -d ' ')"
+          if [[ "$count_archives" -ne 5 ]]; then
+            echo "expected 5 archives, found $count_archives" >&2
+            exit 1
+          fi
+          if [[ ! -f draft-assets/checksums.txt ]]; then
+            echo "missing checksums.txt" >&2; exit 1
+          fi
+          # checksums.txt must list exactly 5 archives (one line per archive).
+          checksum_lines="$(wc -l < draft-assets/checksums.txt | tr -d ' ')"
+          if [[ "$checksum_lines" -ne 5 ]]; then
+            echo "checksums.txt has $checksum_lines lines (expected 5)" >&2
+            exit 1
+          fi
+
+      - name: Extract and run CLI smoke
+        shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -uo pipefail
+          smoke_dir="$(mktemp -d)"
+          tar -xzf draft-assets/sunset_${VERSION}_linux_amd64.tar.gz -C "$smoke_dir"
+          bash .github/scripts/release/smoke.sh "$smoke_dir/sunset" "$VERSION" testdata/go-sample "$smoke_dir/out"
+          rm -rf "$smoke_dir"
+
+      - name: Run external-consumer verification
+        shell: bash
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -uo pipefail
+          work_dir="$(mktemp -d)"
+          bash .github/scripts/release/verify-consumer.sh "$TAG" "$work_dir"
+          rm -rf "$work_dir"
+
+      - name: Build draft-evidence.json
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          PEELED_COMMIT: ${{ needs.preflight.outputs.peeled_commit }}
+          NOTES_DIGEST: ${{ needs.preflight.outputs.notes_digest }}
+        run: |
+          set -uo pipefail
+          mkdir -p evidence
+          release_json="$(gh api "repos/${REPO}/releases/tags/${TAG}")"
+          release_id="$(printf '%s' "$release_json" | jq -r '.id')"
+          checksum_digest="$(sha256sum draft-assets/checksums.txt | awk '{print $1}')"
+          # Build a TSV: <digest>  <name>  <size>, sorted by name for stability.
+          digests_file="$(mktemp)"
+          ( cd draft-assets && sha256sum * ) \
+            | awk '{print $1"\t"$2}' \
+            | sort -k2 > "$digests_file"
+          # Join API sizes (sorted by name) with local digests (sorted by name).
+          sizes_file="$(mktemp)"
+          printf '%s' "$release_json" \
+            | jq -r '.assets | sort_by(.name) | .[] | [.name, (.size|tostring)] | @tsv' \
+            > "$sizes_file"
+          assets_json="$(paste "$sizes_file" "$digests_file" | jq -R -s '
+            split("\n")
+            | map(select(length > 0))
+            | map(split("\t"))
+            | map({
+                name:  .[0],
+                size:  (.[1] | tonumber),
+                digest: .[2]
+              })'
+          )"
+          jq -n \
+            --arg release_id        "$release_id" \
+            --arg tag               "$TAG" \
+            --arg peeled_commit     "$PEELED_COMMIT" \
+            --arg notes_digest      "$NOTES_DIGEST" \
+            --arg checksum_digest   "$checksum_digest" \
+            --argjson assets        "$assets_json" \
+            '{
+              release_id:           $release_id,
+              tag:                  $tag,
+              peeled_commit:        $peeled_commit,
+              notes_digest:         $notes_digest,
+              checksum_file_digest: $checksum_digest,
+              assets:               $assets
+            }' > evidence/draft-evidence.json
+          rm -f "$digests_file" "$sizes_file"
+          cat evidence/draft-evidence.json
+
+      - name: Upload draft-evidence artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: draft-evidence
+          path: evidence/
+          retention-days: 3
+          if-no-files-found: error
+
+  promote:
+    name: Promote draft to public
+    needs: [preflight, verify_draft]
+    if: >
+      needs.preflight.result == 'success'
+      && needs.verify_draft.result == 'success'
+      && (needs.preflight.outputs.mode == 'absent' || needs.preflight.outputs.mode == 'draft')
+    environment:
+      name: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download evidence artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: draft-evidence
+          path: evidence/
+
+      - name: Re-query draft, reassert immutable bindings, promote
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          EXPECTED_NOTES_DIGEST: ${{ needs.preflight.outputs.notes_digest }}
+          EXPECTED_PEELED: ${{ needs.preflight.outputs.peeled_commit }}
+        run: |
+          set -uo pipefail
+          release_json="$(gh api "repos/${REPO}/releases/tags/${TAG}")"
+          rid="$(printf '%s' "$release_json" | jq -r '.id')"
+          draft="$(printf '%s' "$release_json" | jq -r '.draft')"
+          target="$(printf '%s' "$release_json" | jq -r '.target_commitish')"
+          tag_name="$(printf '%s' "$release_json" | jq -r '.tag_name')"
+          notes_digest_actual=""
+          if [[ "$draft" != "true" ]]; then
+            echo "promote: release $rid is not draft (draft=$draft) — refusing to mutate" >&2
+            exit 1
+          fi
+          if [[ "$tag_name" != "$TAG" ]]; then
+            echo "promote: tag_name mismatch: $tag_name vs $TAG" >&2
+            exit 1
+          fi
+          if [[ "$target" != "$EXPECTED_PEELED" ]]; then
+            echo "promote: target_commitish changed: $target vs $EXPECTED_PEELED" >&2
+            exit 1
+          fi
+          evidence_id="$(jq -r '.release_id' evidence/draft-evidence.json)"
+          if [[ "$evidence_id" != "$rid" ]]; then
+            echo "promote: evidence release_id $evidence_id != current $rid" >&2
+            exit 1
+          fi
+          # Re-download all six assets, verify names/sizes/digests/checksum bytes.
+          work="$(mktemp -d)"
+          while IFS=$'\t' read -r name size url; do
+            gh api "$url" > "$work/$name"
+            actual_size="$(wc -c < "$work/$name" | tr -d ' ')"
+            if [[ "$actual_size" != "$size" ]]; then
+              echo "promote: asset $name size mismatch ($actual_size vs $size)" >&2
+              exit 1
+            fi
+          done < <(printf '%s' "$release_json" | jq -r '.assets[] | "\(.name)\t\(.size)\t\(.url)"')
+          ( cd "$work" && sha256sum -c checksums.txt )
+          checksum_digest_actual="$(sha256sum "$work/checksums.txt" | awk '{print $1}')"
+          checksum_digest_evidence="$(jq -r '.checksum_file_digest' evidence/draft-evidence.json)"
+          if [[ "$checksum_digest_actual" != "$checksum_digest_evidence" ]]; then
+            echo "promote: checksums.txt digest changed since verify_draft ($checksum_digest_actual vs $checksum_digest_evidence)" >&2
+            exit 1
+          fi
+          rm -rf "$work"
+          # All immutable bindings reasserted — promote.
+          gh release edit "$TAG" --draft=false --repo "$REPO"
+
+  verify_public:
+    name: Verify public release
+    needs: [preflight, promote]
+    if: >
+      always()
+      && needs.preflight.result == 'success'
+      && (
+        (needs.preflight.outputs.mode == 'published' && needs.promote.result == 'skipped')
+        || (
+          (needs.preflight.outputs.mode == 'absent' || needs.preflight.outputs.mode == 'draft')
+          && needs.promote.result == 'success'
+        )
+      )
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Anonymous asset download + checksum verification
+        shell: bash
+        env:
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -uo pipefail
+          mkdir -p public-assets
+          # Anonymous fetch (no Authorization header, no GH_TOKEN exported).
+          api_root="https://api.github.com/repos/${REPO}/releases"
+          release_json="$(curl -fsS "$api_root/tags/${TAG}")"
+          while IFS=$'\t' read -r name url; do
+            # Follow browser_download_url directly (anonymous).
+            curl -fsSL -o "public-assets/$name" "$url"
+          done < <(printf '%s' "$release_json" | jq -r '.assets[] | "\(.name)\t\(.browser_download_url)"')
+          ( cd public-assets && sha256sum -c checksums.txt )
+          count="$(ls -1 public-assets/*.tar.gz public-assets/*.zip 2>/dev/null | wc -l | tr -d ' ')"
+          if [[ "$count" -ne 5 ]]; then
+            echo "expected 5 public archives, found $count" >&2; exit 1
+          fi
+
+      - name: Checkout exact tag (published mode only)
+        if: needs.preflight.outputs.mode == 'published'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.preflight.outputs.tag }}
+          persist-credentials: false
+
+      - name: Set up Go (published mode, cache disabled)
+        if: needs.preflight.outputs.mode == 'published'
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: 'Published mode: unique caches, CLI install/smoke, consumer'
+        if: needs.preflight.outputs.mode == 'published'
+        shell: bash
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -uo pipefail
+          cache_dir="$(mktemp -d)"
+          export GOCACHE="$cache_dir/gocache"
+          export GOMODCACHE="$cache_dir/gomodcache"
+          export GOBIN="$cache_dir/gobin"
+          mkdir -p "$GOCACHE" "$GOMODCACHE" "$GOBIN"
+          smoke_dir="$(mktemp -d)"
+          tar -xzf public-assets/sunset_${VERSION}_linux_amd64.tar.gz -C "$smoke_dir"
+          bash .github/scripts/release/smoke.sh "$smoke_dir/sunset" "$VERSION" testdata/go-sample "$smoke_dir/out"
+          work_dir="$(mktemp -d)"
+          bash .github/scripts/release/verify-consumer.sh "$TAG" "$work_dir"
+          rm -rf "$smoke_dir" "$work_dir" "$cache_dir"
+
+  telemetry:
+    name: Telemetry
+    needs: [preflight, build_native, stage_draft, verify_draft, promote, verify_public]
+    if: always() && needs.preflight.result != 'skipped'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+    steps:
+      - name: Checkout exact tag (helpers)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.preflight.outputs.tag }}
+          persist-credentials: false
+
+      - name: Fetch run + paginated jobs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          mkdir -p telemetry
+          gh api "repos/${REPO}/actions/runs/${RUN_ID}" > telemetry/run.json
+          for page in 1 2 3 4 5; do
+            out="telemetry/jobs_${page}.json"
+            gh api "repos/${REPO}/actions/runs/${RUN_ID}/jobs?per_page=100&page=${page}" >"$out"
+            count="$(jq '.jobs | length' "$out")"
+            if [[ "$count" -eq 0 ]]; then rm -f "$out"; break; fi
+            if [[ "$count" -lt 100 ]]; then break; fi
+          done
+          ls -la telemetry/
+
+      - name: Compute timing model
+        shell: bash
+        run: |
+          set -uo pipefail
+          bash .github/scripts/release/collect-timing.sh telemetry/run.json telemetry/ > telemetry/summary.json
+          cat telemetry/summary.json
+
+      - name: Write workflow summary
+        shell: bash
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          summary="$(cat telemetry/summary.json)"
+          {
+            echo "## Release telemetry"
+            echo
+            echo '```json'
+            echo "$summary"
+            echo '```'
+            echo
+            echo "Run: $RUN_URL"
+          } >> "$GITHUB_STEP_SUMMARY"

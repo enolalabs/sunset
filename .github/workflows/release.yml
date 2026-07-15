@@ -588,14 +588,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           TAG: ${{ needs.preflight.outputs.tag }}
-          DRAFT_RELEASE_ID: ${{ needs.stage_draft.outputs.draft_release_id }}
         run: |
           set -uo pipefail
           mkdir -p draft-assets
-          release_json="$(gh api "repos/${REPO}/releases/${DRAFT_RELEASE_ID}")"
+          release_json="$(gh api "repos/${REPO}/releases/tags/${TAG}")"
           asset_count="$(printf '%s' "$release_json" | jq '.assets | length')"
           if [[ "$asset_count" -eq 0 ]]; then
-            echo "no assets on draft release $DRAFT_RELEASE_ID" >&2
+            echo "no assets on draft release $TAG" >&2
             exit 1
           fi
           while IFS=$'\t' read -r name asset_id; do

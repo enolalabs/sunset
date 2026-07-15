@@ -334,3 +334,4 @@ if ($script:Fail -gt 0) {
     exit 1
 }
 Write-Host "All tests passed."
+exit 0

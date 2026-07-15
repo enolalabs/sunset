@@ -91,6 +91,15 @@ sunset/
 - Check all error returns (`errcheck` is enforced)
 - Keep the public API in `pkg/sunset/` minimal
 
+## Releases
+
+The release process — from a validated commit to an immutable public release —
+is documented in [`docs/releasing.md`](docs/releasing.md).  Canonical,
+checksum-verified install snippets live under
+[`docs/snippets/`](docs/snippets) and are kept in sync with the README by
+`.github/scripts/release/check-doc-snippets.sh`.  Run it before opening a PR
+that touches install instructions or release notes.
+
 ## Reporting Issues
 
 Please include:

@@ -16,26 +16,220 @@ Sunset scans your project, extracts functions, types, imports, and docstrings, t
 
 ## Install
 
+Pre-built binaries for **v1.0.1** are published on the
+[GitHub Releases](https://github.com/enolalabs/sunset/releases) page.  Each
+archive is named `sunset_<version>_<os>_<arch>.<format>` and is accompanied by
+a `checksums.txt` file listing every SHA-256 digest.
+
+### v1.0.1 release targets
+
+| OS | Arch | Archive | Verified on |
+|---|---|---|---|
+| Linux | amd64 | `sunset_1.0.1_linux_amd64.tar.gz` | `ubuntu-24.04` |
+| Linux | arm64 | `sunset_1.0.1_linux_arm64.tar.gz` | `ubuntu-24.04-arm` |
+| macOS | amd64 | `sunset_1.0.1_darwin_amd64.tar.gz` | `macos-15-intel` |
+| macOS | arm64 | `sunset_1.0.1_darwin_arm64.tar.gz` | `macos-15` |
+| Windows | amd64 | `sunset_1.0.1_windows_amd64.zip` | `windows-2025` |
+
+> Targets are built and verified on the named GitHub Actions runner
+> environments.  No minimum OS or libc compatibility is claimed.
+
+### Install with checksum verification
+
+Each snippet below downloads **only** its target archive plus `checksums.txt`,
+selects the matching SHA-256 entry, verifies it, extracts the archive, and runs
+`sunset version`.  The snippets default to the version-explicit `v1.0.1` URL;
+override `SUNSET_BASE_URL` to point at a loopback server for native pre-tag
+testing.
+
+> **SHA-256 detects corruption and byte mismatches but does NOT authenticate
+> the publisher.**  Signing and attestations remain future work.
+
+#### Linux
+
+<!-- snippet: docs/snippets/v1.0.1/install-linux.sh -->
+```bash
+#!/usr/bin/env bash
+# install-linux.sh — Install sunset v1.0.1 on Linux (amd64 or arm64).
+#
+# Downloads ONLY the target archive plus checksums.txt, verifies the matching
+# SHA-256 entry, extracts the archive, and runs `sunset version`.
+#
+# Defaults to the public v1.0.1 release URL.  Override the base URL for native
+# pre-tag testing:
+#
+#   SUNSET_BASE_URL=http://127.0.0.1:8080 ./install-linux.sh [amd64|arm64]
+#
+# SHA-256 detects corruption and byte mismatches.  It does NOT authenticate
+# the publisher; signing and attestations remain future work.
+set -euo pipefail
+
+VERSION="1.0.1"
+BASE_URL="${SUNSET_BASE_URL:-https://github.com/enolalabs/sunset/releases/download/v${VERSION}}"
+ARCH="${1:-$(uname -m)}"
+
+case "$ARCH" in
+    x86_64)         ARCH="amd64" ;;
+    aarch64|arm64)  ARCH="arm64" ;;
+    amd64|arm64)    ;;
+    *)
+        echo "install-linux: unsupported arch '$ARCH' (expected amd64 or arm64)" >&2
+        exit 2
+        ;;
+esac
+
+ARCHIVE="sunset_${VERSION}_linux_${ARCH}.tar.gz"
+INSTALL_DIR="${SUNSET_INSTALL_DIR:-/usr/local/bin}"
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+echo "==> Downloading $ARCHIVE and checksums.txt"
+curl -fsSL -o "$WORK/$ARCHIVE"      "${BASE_URL}/${ARCHIVE}"
+curl -fsSL -o "$WORK/checksums.txt" "${BASE_URL}/checksums.txt"
+
+echo "==> Verifying SHA-256 (selecting the $ARCHIVE entry)"
+( cd "$WORK" && grep -F "$ARCHIVE" checksums.txt | sha256sum --check - )
+
+echo "==> Extracting and installing to $INSTALL_DIR"
+tar -xzf "$WORK/$ARCHIVE" -C "$WORK"
+if [ -w "$INSTALL_DIR" ]; then
+    mv "$WORK/sunset" "$INSTALL_DIR/sunset"
+else
+    sudo mv "$WORK/sunset" "$INSTALL_DIR/sunset"
+fi
+
+echo "==> Verifying install"
+"$INSTALL_DIR/sunset" version
+```
+<!-- /snippet: docs/snippets/v1.0.1/install-linux.sh -->
+
+#### macOS
+
+<!-- snippet: docs/snippets/v1.0.1/install-macos.sh -->
+```bash
+#!/usr/bin/env bash
+# install-macos.sh — Install sunset v1.0.1 on macOS (amd64 or arm64).
+#
+# Downloads ONLY the target archive plus checksums.txt, verifies the matching
+# SHA-256 entry, extracts the archive, and runs `sunset version`.
+#
+# Defaults to the public v1.0.1 release URL.  Override the base URL for native
+# pre-tag testing:
+#
+#   SUNSET_BASE_URL=http://127.0.0.1:8080 ./install-macos.sh [amd64|arm64]
+#
+# SHA-256 detects corruption and byte mismatches.  It does NOT authenticate
+# the publisher; signing and attestations remain future work.
+set -euo pipefail
+
+VERSION="1.0.1"
+BASE_URL="${SUNSET_BASE_URL:-https://github.com/enolalabs/sunset/releases/download/v${VERSION}}"
+ARCH="${1:-$(uname -m)}"
+
+case "$ARCH" in
+    x86_64)      ARCH="amd64" ;;
+    arm64)       ARCH="arm64" ;;
+    amd64|arm64) ;;
+    *)
+        echo "install-macos: unsupported arch '$ARCH' (expected amd64 or arm64)" >&2
+        exit 2
+        ;;
+esac
+
+ARCHIVE="sunset_${VERSION}_darwin_${ARCH}.tar.gz"
+INSTALL_DIR="${SUNSET_INSTALL_DIR:-/usr/local/bin}"
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+echo "==> Downloading $ARCHIVE and checksums.txt"
+curl -fsSL -o "$WORK/$ARCHIVE"      "${BASE_URL}/${ARCHIVE}"
+curl -fsSL -o "$WORK/checksums.txt" "${BASE_URL}/checksums.txt"
+
+echo "==> Verifying SHA-256 (selecting the $ARCHIVE entry)"
+( cd "$WORK" && grep -F "$ARCHIVE" checksums.txt | shasum -a 256 -c - )
+
+echo "==> Extracting and installing to $INSTALL_DIR"
+tar -xzf "$WORK/$ARCHIVE" -C "$WORK"
+if [ -w "$INSTALL_DIR" ]; then
+    mv "$WORK/sunset" "$INSTALL_DIR/sunset"
+else
+    sudo mv "$WORK/sunset" "$INSTALL_DIR/sunset"
+fi
+
+echo "==> Verifying install"
+"$INSTALL_DIR/sunset" version
+```
+<!-- /snippet: docs/snippets/v1.0.1/install-macos.sh -->
+
+#### Windows
+
+<!-- snippet: docs/snippets/v1.0.1/install-windows.ps1 -->
+```powershell
+# install-windows.ps1 — Install sunset v1.0.1 on Windows (amd64).
+#
+# Downloads ONLY the target archive plus checksums.txt, verifies the matching
+# SHA-256 digest, extracts the archive, and runs `sunset version`.
+#
+# Defaults to the public v1.0.1 release URL.  Override the base URL for native
+# pre-tag testing:
+#
+#   $env:SUNSET_BASE_URL = "http://127.0.0.1:8080"; .\install-windows.ps1
+#
+# SHA-256 detects corruption and byte mismatches.  It does NOT authenticate
+# the publisher; signing and attestations remain future work.
+$ErrorActionPreference = "Stop"
+
+$Version    = "1.0.1"
+$DefaultUrl = "https://github.com/enolalabs/sunset/releases/download/v$Version"
+$BaseUrl    = if ($env:SUNSET_BASE_URL) { $env:SUNSET_BASE_URL } else { $DefaultUrl }
+$Arch       = "amd64"
+
+$Archive    = "sunset_${Version}_windows_${Arch}.zip"
+$InstallDir = if ($env:SUNSET_INSTALL_DIR) { $env:SUNSET_INSTALL_DIR } else { "$env:LOCALAPPDATA\Programs\sunset" }
+
+$Work = Join-Path $env:TEMP "sunset-install-$([guid]::NewGuid())"
+New-Item -ItemType Directory -Path $Work -Force | Out-Null
+
+try {
+    Write-Host "==> Downloading $Archive and checksums.txt"
+    Invoke-WebRequest -Uri "$BaseUrl/$Archive"      -OutFile "$Work\$Archive"      -UseBasicParsing
+    Invoke-WebRequest -Uri "$BaseUrl/checksums.txt" -OutFile "$Work\checksums.txt" -UseBasicParsing
+
+    Write-Host "==> Verifying SHA-256 (selecting the $Archive entry)"
+    $line = Get-Content "$Work\checksums.txt" | Where-Object { $_ -like "*$Archive" }
+    if (-not $line) { throw "no checksum entry for $Archive in checksums.txt" }
+    $expected = ($line -split '\s+')[0].Trim()
+    $actual   = (Get-FileHash -Algorithm SHA256 "$Work\$Archive").Hash
+    if ($actual.ToLower() -ne $expected.ToLower()) {
+        throw "checksum mismatch for $Archive (expected $expected, got $actual)"
+    }
+
+    Write-Host "==> Extracting and installing to $InstallDir"
+    Expand-Archive -Path "$Work\$Archive" -DestinationPath $Work -Force
+    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+    Move-Item -Path "$Work\sunset.exe" -Destination "$InstallDir\sunset.exe" -Force
+
+    Write-Host "==> Verifying install"
+    & "$InstallDir\sunset.exe" version
+}
+finally {
+    Remove-Item -Recurse -Force $Work -ErrorAction SilentlyContinue
+}
+```
+<!-- /snippet: docs/snippets/v1.0.1/install-windows.ps1 -->
+
 ### From source
 
 ```bash
 go install github.com/enolalabs/sunset/cmd/sunset@latest
 ```
 
-### From binary
+Import the library:
 
-Download from [GitHub Releases](https://github.com/enolalabs/sunset/releases):
-
-| Platform | Architecture | File |
-|---|---|---|
-| Linux | x86_64 | `sunset_*_linux_amd64.tar.gz` |
-| Linux | ARM64 | `sunset_*_linux_arm64.tar.gz` |
-| macOS | Apple Silicon | `sunset_*_darwin_arm64.tar.gz` |
-
-```bash
-# Example: Linux amd64
-curl -sL https://github.com/enolalabs/sunset/releases/latest/download/sunset_1.0.0_linux_amd64.tar.gz | tar xz
-sudo mv sunset /usr/local/bin/
+```go
+import "github.com/enolalabs/sunset/pkg/sunset"
 ```
 
 ### Build locally

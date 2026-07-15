@@ -367,6 +367,8 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write
+    outputs:
+      draft_release_id: ${{ steps.create.outputs.release_id }}
     steps:
       - name: Download notes artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -586,10 +588,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           TAG: ${{ needs.preflight.outputs.tag }}
+          DRAFT_RELEASE_ID: ${{ needs.stage_draft.outputs.draft_release_id }}
         run: |
           set -uo pipefail
           mkdir -p draft-assets
-          assets_json="$(gh api "repos/${REPO}/releases/tags/${TAG}" --jq '.assets[] | "\(.name)\t\(.size)\t\(.url)"')"
+          assets_json="$(gh api "repos/${REPO}/releases/${DRAFT_RELEASE_ID}/assets" --jq '.[] | "\(.name)\t\(.size)\t\(.url)"')"
           if [[ -z "$assets_json" ]]; then
             echo "no assets on draft release $TAG" >&2
             exit 1
